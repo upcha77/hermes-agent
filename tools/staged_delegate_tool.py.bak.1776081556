@@ -27,16 +27,14 @@ from tools.delegate_tool import delegate_task as _delegate_task
 import sys
 import os
 
-# 동적 스킬 모듈 로딩
-# 표준 스킬 경로: ~/.hermes/skills/02-dev/unified-dev-agent  (통합 개발 에이전트)
-SKILL_PATH = os.path.expanduser("~/.hermes/skills/02-dev/unified-dev-agent")
+# 동적 스킬 모듈 로딩 (팀 에이전트 하네스가 설치된 경우에만 활성화)
+# 표준 스킬 경로: ~/.hermes/skills/software-development/team-harness/scripts
+SKILL_PATH = os.path.expanduser("~/.hermes/skills/software-development/team-harness/scripts")
 if os.path.exists(SKILL_PATH) and SKILL_PATH not in sys.path:
     sys.path.insert(0, SKILL_PATH)
 
 try:
-    # unified-dev-agent 내장 harness 사용 (EnforcementEngine)
-    from modules.harness import EnforcementEngine as HarnessHookManager
-    get_project_harness_config = None  # unified-dev-agent는 config.yaml로 관리
+    from harness_hooks import HarnessHookManager, get_project_harness_config
 except ImportError:
     HarnessHookManager = None
     get_project_harness_config = None
@@ -1093,36 +1091,6 @@ try:
     def _check_staged_delegate() -> bool:
         """Check if staged_delegate requirements are met."""
         return True  # No special requirements
-
-    registry.register_tool(
-        name="staged_delegate",
-        toolset="agent",
-        schema={
-            "description": "OMC-style multi-agent orchestration with staged pipeline",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "goal": {"type": "string"},
-                    "mode": {"type": "string", "enum": ["team", "ccg", "autopilot", "ralph", "ultrawork"]},
-                    "stages": {"type": "array", "items": {"type": "string"}},
-                    "stage_agents": {"type": "object"},
-                    "models": {"type": "array", "items": {"type": "string"}},
-                    "max_iterations": {"type": "integer", "default": 5},
-                    "parallel": {"type": "integer", "default": 3},
-                    "context": {"type": "object"},
-                },
-                "required": ["goal", "mode"]
-            }
-        },
-        handler=staged_delegate,
-        check_fn=_check_staged_delegate,
-        description="OMC-style multi-agent orchestration",
-        emoji="🎭",
-    )
-except ImportError:
-    pass  # Registry not available during import
-
-
 # Unified Dev Agent 통합 (02-dev/unified-dev-agent)
 # 계층적 개발 에이전트 - 규모 기반 자동 라우팅
 
@@ -1139,19 +1107,48 @@ except ImportError:
 
 def unified_dev_delegate(
     goal: str,
-    mode: str = "auto",
+    mode: str = "auto",  # "auto", "quick", "quick_plus", "full"
     context: Optional[Dict] = None,
     force_mode: Optional[str] = None,
     mock: bool = False,
 ) -> Dict[str, Any]:
-    """Unified Dev Agent 통합 실행"""
+    """
+    Unified Dev Agent 통합 실행
+    
+    계층적 개발 파이프라인:
+    - auto: 규모 분석 → 적절한 모드 자동 선택
+    - quick: ≤20줄, 단일 에이전트, 5초 완료
+    - quick_plus: ≤100줄, 2단계 검증, 30초 완료  
+    - full: >100줄, 7단계 완전 파이프라인, 10-20분
+    
+    Args:
+        goal: 개발 목표
+        mode: "auto", "quick", "quick_plus", "full"
+        context: 추가 컨텍스트 (files, working_dir 등)
+        force_mode: 강제 모드 (mode보다 우선)
+        mock: 테스트용 Mock 실행
+    
+    Returns:
+        {
+            "success": bool,
+            "mode_used": str,
+            "duration_seconds": float,
+            "analysis": {...},
+            ...
+        }
+    """
     if not UNIFIED_DEV_AVAILABLE:
         return {
             "success": False,
             "error": "unified-dev-agent not installed",
+            "hint": "Run: ls ~/.hermes/skills/02-dev/unified-dev-agent",
         }
     
-    force = force_mode if mode == "auto" else mode
+    # 모드 매핑
+    if mode == "auto":
+        force = force_mode  # auto는 unified_dev 내부에서 결정
+    else:
+        force = mode  # quick, quick_plus, full
     
     try:
         result = unified_dev(goal, context, force_mode=force, mock=mock)
@@ -1164,7 +1161,10 @@ def unified_dev_delegate(
         }
     except Exception as e:
         logger.exception("unified_dev_delegate failed")
-        return {"success": False, "error": str(e)}
+        return {
+            "success": False,
+            "error": str(e),
+        }
 
 
 def _check_unified_dev() -> bool:
@@ -1179,15 +1179,34 @@ try:
     register_tool(
         name="unified_dev",
         schema={
-            "description": "Unified Development Agent with auto-routing",
+            "description": "Unified Development Agent - Hierarchical dev pipeline with auto-routing based on project scale",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "goal": {"type": "string"},
-                    "mode": {"type": "string", "enum": ["auto", "quick", "quick_plus", "full"]},
-                    "context": {"type": "object"},
-                    "force_mode": {"type": "string"},
-                    "mock": {"type": "boolean", "default": False},
+                    "goal": {
+                        "type": "string",
+                        "description": "Development goal or task description"
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["auto", "quick", "quick_plus", "full"],
+                        "default": "auto",
+                        "description": "Execution mode: auto (scale-based), quick (5s), quick_plus (30s), full (7-stage)"
+                    },
+                    "context": {
+                        "type": "object",
+                        "description": "Additional context (files, working_dir, etc.)"
+                    },
+                    "force_mode": {
+                        "type": "string",
+                        "enum": ["quick", "quick_plus", "full"],
+                        "description": "Override automatic mode selection"
+                    },
+                    "mock": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Run in mock mode (no actual CLI calls, for testing)"
+                    }
                 },
                 "required": ["goal"]
             }
@@ -1200,8 +1219,84 @@ try:
             mock=args.get("mock", False),
         ),
         check_fn=_check_unified_dev,
-        description="Unified Development Agent",
+        description="Unified Development Agent with auto-routing (quick/quick_plus/full modes)",
         emoji="🔧",
     )
 except ImportError:
-    pass
+    pass  # Registry not available during import
+
+
+try:
+    from mcp_registry import register_tool
+    
+    register_tool(
+        name="staged_delegate",
+        schema={
+            "description": "OMC-style multi-agent orchestration with staged pipeline (team/ccg/autopilot/ralph/ultrawork modes). Supports OpenCode, Codex, and Hermes native agents.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal": {
+                        "type": "string",
+                        "description": "Task goal or description"
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["team", "ccg", "autopilot", "ralph", "ultrawork"],
+                        "description": "Orchestration mode"
+                    },
+                    "stages": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Stages for team mode (plan, prd, exec, verify, fix)"
+                    },
+                    "stage_agents": {
+                        "type": "object",
+                        "description": "Agent mapping per stage (claude, codex, opencode, gemini)"
+                    },
+                    "models": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Models for CCG mode"
+                    },
+                    "max_iterations": {
+                        "type": "integer",
+                        "description": "Max iterations for verify-fix loops",
+                        "default": 5
+                    },
+                    "parallel": {
+                        "type": "integer",
+                        "description": "Parallel agents for ultrawork mode",
+                        "default": 3
+                    },
+                    "context": {
+                        "type": "object",
+                        "description": "Additional context"
+                    },
+                    "total_minutes": {
+                        "type": "integer",
+                        "description": "Ralph 모드 전용: 강제 반복 시간 (분). 기본 30분.",
+                        "default": 30
+                    }
+                },
+                "required": ["goal", "mode"]
+            }
+        },
+        handler=lambda args, **kw: staged_delegate(
+            goal=args.get("goal"),
+            mode=args.get("mode", "team"),
+            stages=args.get("stages"),
+            stage_agents=args.get("stage_agents"),
+            models=args.get("models"),
+            max_iterations=args.get("max_iterations", 5),
+            parallel=args.get("parallel", 3),
+            context=args.get("context"),
+            parent_agent=kw.get("parent_agent"),
+            total_minutes=args.get("total_minutes"),
+        ),
+        check_fn=_check_staged_delegate,
+        description="OMC-style multi-agent orchestration with OpenCode/Codex/Hermes integration",
+        emoji="🎭",
+    )
+except ImportError:
+    pass  # Registry not available during import
