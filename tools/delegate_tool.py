@@ -23,7 +23,8 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional
 
 from toolsets import TOOLSETS
 
@@ -36,6 +37,65 @@ DELEGATE_BLOCKED_TOOLS = frozenset([
     "send_message",    # no cross-platform side effects
     "execute_code",    # children should reason step-by-step, not write scripts
 ])
+
+
+@dataclass
+class UnifiedResult:
+    """Unified result object for all agent execution modes (native/CLI/fallback).
+    
+    Provides consistent interface regardless of which agent actually executed the task.
+    """
+    success: bool = False
+    output: str = ""
+    agent_type: str = ""           # 실제 실행된 에이전트
+    original_agent: str = ""       # 처음 요청한 에이전트
+    fallback_depth: int = 0        # 폴백 단계 (0 = 폴백 없음)
+    fallback_delay: float = 0.0    # 폴백 대기 시간
+    duration: float = 0.0          # 실행 소요 시간
+    api_calls: int = 0             # API 호출 횟수
+    tool_trace: List[Dict] = field(default_factory=list)
+    error: Optional[str] = None    # 에러 메시지
+    
+    def is_fallback(self) -> bool:
+        """Check if this result involved a fallback agent."""
+        return self.fallback_depth > 0
+    
+    def get_execution_path(self) -> str:
+        """Get human-readable execution path string."""
+        if self.is_fallback():
+            return f"{self.original_agent} → {self.agent_type} (폴백 {self.fallback_depth}단계)"
+        return self.agent_type
+    
+    def to_json(self) -> str:
+        """Serialize to JSON string."""
+        return json.dumps({
+            "success": self.success,
+            "output": self.output,
+            "agent_type": self.agent_type,
+            "original_agent": self.original_agent,
+            "fallback_depth": self.fallback_depth,
+            "fallback_delay": self.fallback_delay,
+            "duration": self.duration,
+            "api_calls": self.api_calls,
+            "error": self.error,
+        }, ensure_ascii=False, indent=2)
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "UnifiedResult":
+        """Create from dictionary."""
+        return cls(
+            success=data.get("success", False),
+            output=data.get("output", ""),
+            agent_type=data.get("agent_type", ""),
+            original_agent=data.get("original_agent", ""),
+            fallback_depth=data.get("fallback_depth", 0),
+            fallback_delay=data.get("fallback_delay", 0.0),
+            duration=data.get("duration", 0.0),
+            api_calls=data.get("api_calls", 0),
+            tool_trace=data.get("tool_trace", []),
+            error=data.get("error"),
+        )
+
 
 # Build a description fragment listing toolsets available for subagents.
 # Excludes toolsets where ALL tools are blocked, composite/platform toolsets
@@ -50,7 +110,209 @@ _SUBAGENT_TOOLSETS = sorted(
 _TOOLSET_LIST_STR = ", ".join(f"'{n}'" for n in _SUBAGENT_TOOLSETS)
 
 _DEFAULT_MAX_CONCURRENT_CHILDREN = 3
-MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 폴백 (Fallback) 및 재시도 설정
+# ═════════════════════════════════════════════════════════════════════════════
+
+# 지수 백오프 설정
+FALLBACK_INITIAL_DELAY = 2.0    # 첫 폴백 대기 (초)
+FALLBACK_MAX_DELAY = 30.0       # 최대 대기 (초)
+FALLBACK_BACKOFF_FACTOR = 2.0   # 백오프 배수
+MAX_FALLBACK_DEPTH = 3          # 최대 폴백 깊이
+
+# Native (Claude) 재시도 설정
+CLAUDE_MAX_RETRIES = 2          # 최대 재시도 횟수
+CLAUDE_RETRY_DELAY = 3.0        # 재시도 간 대기 (초)
+
+# 기타 설정
+MAX_DEPTH = 2                   # parent (0) -> child (1) -> grandchild rejected (2)
+
+
+def _calculate_fallback_delay(fallback_depth: int) -> float:
+    """Calculate exponential backoff delay for fallback.
+    
+    Args:
+        fallback_depth: Current fallback depth (1-indexed)
+        
+    Returns:
+        Delay in seconds, capped at FALLBACK_MAX_DELAY
+    """
+    delay = FALLBACK_INITIAL_DELAY * (FALLBACK_BACKOFF_FACTOR ** (fallback_depth - 1))
+    return min(delay, FALLBACK_MAX_DELAY)
+
+
+def _log_fallback(
+    original_agent: str,
+    fallback_agent: str,
+    reason: str,
+    delay: float,
+    depth: int
+) -> None:
+    """Log fallback event with structured information.
+    
+    Args:
+        original_agent: Originally requested agent
+        fallback_agent: Agent being fallen back to
+        reason: Why the fallback occurred
+        delay: Delay before fallback execution
+        depth: Fallback depth
+    """
+    logger.warning(
+        "[StagedDelegate:WARN] 🔄 FALLBACK: %s → %s",
+        original_agent,
+        fallback_agent
+    )
+    logger.warning(
+        "[StagedDelegate:WARN]    Reason: %s",
+        reason
+    )
+    logger.warning(
+        "[StagedDelegate:WARN]    Delay: %.1fs (depth=%d)",
+        delay,
+        depth
+    )
+
+
+class FallbackTracker:
+    """Track fallback execution statistics across delegation sessions.
+    
+    This class provides visibility into fallback patterns, helping identify
+    unreliable agents and optimize fallback chains.
+    
+    Example:
+        tracker = FallbackTracker()
+        tracker.record_attempt("opencode", "cline", "timeout", 2.0)
+        stats = tracker.get_stats()
+        print(f"Fallback rate: {stats['fallback_rate']:.1%}")
+    """
+    
+    def __init__(self):
+        self._attempts: List[Dict[str, Any]] = []
+        self._agent_stats: Dict[str, Dict[str, int]] = {}
+    
+    def record_attempt(
+        self,
+        original_agent: str,
+        final_agent: str,
+        reason: str,
+        total_delay: float,
+        success: bool = True
+    ) -> None:
+        """Record a delegation attempt with fallback info.
+        
+        Args:
+            original_agent: Initially requested agent
+            final_agent: Agent that actually executed
+            reason: Why fallback occurred (if any)
+            total_delay: Sum of all fallback delays
+            success: Whether execution succeeded
+        """
+        import time
+        self._attempts.append({
+            "timestamp": time.time(),
+            "original_agent": original_agent,
+            "final_agent": final_agent,
+            "reason": reason,
+            "total_delay": total_delay,
+            "success": success,
+            "fallback_used": original_agent != final_agent,
+        })
+        
+        # Update per-agent stats
+        for agent in [original_agent, final_agent]:
+            if agent not in self._agent_stats:
+                self._agent_stats[agent] = {"attempts": 0, "failures": 0}
+            self._agent_stats[agent]["attempts"] += 1
+        
+        if not success:
+            self._agent_stats[final_agent]["failures"] += 1
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get aggregate fallback statistics.
+        
+        Returns:
+            Dict with keys:
+            - total_attempts: Total delegation attempts
+            - fallback_count: Number of attempts with fallback
+            - fallback_rate: Percentage requiring fallback
+            - avg_delay: Average total fallback delay
+            - agent_reliability: Dict of per-agent success rates
+        """
+        if not self._attempts:
+            return {
+                "total_attempts": 0,
+                "fallback_count": 0,
+                "fallback_rate": 0.0,
+                "avg_delay": 0.0,
+                "agent_reliability": {},
+            }
+        
+        fallback_count = sum(1 for a in self._attempts if a["fallback_used"])
+        total_delay = sum(a["total_delay"] for a in self._attempts)
+        
+        # Per-agent reliability
+        reliability = {}
+        for agent, stats in self._agent_stats.items():
+            if stats["attempts"] > 0:
+                reliability[agent] = {
+                    "attempts": stats["attempts"],
+                    "failures": stats["failures"],
+                    "success_rate": (stats["attempts"] - stats["failures"]) / stats["attempts"],
+                }
+        
+        return {
+            "total_attempts": len(self._attempts),
+            "fallback_count": fallback_count,
+            "fallback_rate": fallback_count / len(self._attempts),
+            "avg_delay": total_delay / len(self._attempts),
+            "agent_reliability": reliability,
+        }
+    
+    def get_fallback_chain_report(self) -> List[Dict[str, Any]]:
+        """Get detailed report of all fallback chains used.
+        
+        Returns:
+            List of dicts with fallback chain patterns and frequencies.
+        """
+        from collections import Counter
+        
+        chains = [
+            f"{a['original_agent']} → {a['final_agent']}"
+            for a in self._attempts
+            if a["fallback_used"]
+        ]
+        
+        counts = Counter(chains)
+        return [
+            {"chain": chain, "count": count, "percentage": count / len(self._attempts)}
+            for chain, count in counts.most_common()
+        ]
+    
+    def to_json(self) -> str:
+        """Serialize statistics to JSON."""
+        return json.dumps({
+            "stats": self.get_stats(),
+            "fallback_chains": self.get_fallback_chain_report(),
+        }, ensure_ascii=False, indent=2)
+
+
+# Global fallback tracker instance (session-level)
+_fallback_tracker: Optional[FallbackTracker] = None
+
+
+def get_fallback_tracker() -> FallbackTracker:
+    """Get or create the global fallback tracker."""
+    global _fallback_tracker
+    if _fallback_tracker is None:
+        _fallback_tracker = FallbackTracker()
+    return _fallback_tracker
+
+
+def reset_fallback_tracker() -> None:
+    """Reset the global fallback tracker."""
+    global _fallback_tracker
+    _fallback_tracker = FallbackTracker()
 
 
 def _get_max_concurrent_children() -> int:
@@ -1101,3 +1363,14 @@ registry.register(
     check_fn=check_delegate_requirements,
     emoji="🔀",
 )
+
+
+
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# NOTE: 랄프루프(RalfLoop) 기능은 staged_delegate_tool.py의
+# _run_ralph_loop() 메서드로 이관되었습니다.
+# 사용법: staged_delegate(goal="...", mode="ralph", total_minutes=30)
+# ═════════════════════════════════════════════════════════════════════════════
+
